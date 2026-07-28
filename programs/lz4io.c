@@ -928,6 +928,21 @@ int LZ4IO_compressFilename_Legacy(const char* input_filename,
 }
 
 #define FNSPACE 30
+
+/* Grow *buf to at least needed bytes. Returns 0 on success, 1 on OOM.
+ * Avoids the historical `ifnSize + 20` under-allocation when suffix is long. */
+static int LZ4IO_growFileNameBuffer(char** buf, size_t* bufSize, size_t needed)
+{
+    char* newBuf;
+    if (*bufSize >= needed) return 0;
+    newBuf = (char*)malloc(needed);
+    if (newBuf == NULL) return 1;
+    free(*buf);
+    *buf = newBuf;
+    *bufSize = needed;
+    return 0;
+}
+
 /* LZ4IO_compressMultipleFilenames_Legacy :
  * This function is intentionally "hidden" (not published in .h)
  * It generates multiple compressed streams using the old 'legacy' format */
@@ -951,6 +966,7 @@ int LZ4IO_compressMultipleFilenames_Legacy(
     for (i=0; i<ifntSize; i++) {
         unsigned long long processed = 0;
         size_t const ifnSize = strlen(inFileNamesTable[i]);
+        size_t neededSize;
         if (LZ4IO_isStdout(suffix)) {
             missed_files += LZ4IO_compressLegacy_internal(&processed,
                                     inFileNamesTable[i], stdoutmark,
@@ -959,13 +975,14 @@ int LZ4IO_compressMultipleFilenames_Legacy(
             continue;
         }
 
-        if (ofnSize <= ifnSize+suffixSize+1) {
-            free(dstFileName);
-            ofnSize = ifnSize + 20;
-            dstFileName = (char*)malloc(ofnSize);
-            if (dstFileName==NULL) {
-                return ifntSize;
-        }   }
+        if (ifnSize > (size_t)-1 - suffixSize - 1) {
+            missed_files++;
+            continue;
+        }
+        neededSize = ifnSize + suffixSize + 1;
+        if (LZ4IO_growFileNameBuffer(&dstFileName, &ofnSize, neededSize)) {
+            return ifntSize;
+        }
         strcpy(dstFileName, inFileNamesTable[i]);
         strcat(dstFileName, suffix);
 
@@ -1551,6 +1568,7 @@ int LZ4IO_compressMultipleFilenames(
     for (i=0; i<ifntSize; i++) {
         unsigned long long processed;
         size_t const ifnSize = strlen(inFileNamesTable[i]);
+        size_t neededSize;
         if (LZ4IO_isStdout(suffix)) {
             missed_files += LZ4IO_compressFilename_extRess(&processed, &ress,
                                     inFileNamesTable[i], stdoutmark,
@@ -1559,14 +1577,15 @@ int LZ4IO_compressMultipleFilenames(
             continue;
         }
         /* suffix != stdout => compress into a file => generate its name */
-        if (ofnSize <= ifnSize+suffixSize+1) {
-            free(dstFileName);
-            ofnSize = ifnSize + 20;
-            dstFileName = (char*)malloc(ofnSize);
-            if (dstFileName==NULL) {
-                LZ4IO_freeCResources(ress);
-                return ifntSize;
-        }   }
+        if (ifnSize > (size_t)-1 - suffixSize - 1) {
+            missed_files++;
+            continue;
+        }
+        neededSize = ifnSize + suffixSize + 1;
+        if (LZ4IO_growFileNameBuffer(&dstFileName, &ofnSize, neededSize)) {
+            LZ4IO_freeCResources(ress);
+            return ifntSize;
+        }
         strcpy(dstFileName, inFileNamesTable[i]);
         strcat(dstFileName, suffix);
 
@@ -2530,23 +2549,24 @@ int LZ4IO_decompressMultipleFilenames(
     for (i=0; i<ifntSize; i++) {
         unsigned long long processed = 0;
         size_t const ifnSize = strlen(inFileNamesTable[i]);
-        const char* const suffixPtr = inFileNamesTable[i] + ifnSize - suffixSize;
+        size_t neededSize;
         if (LZ4IO_isStdout(suffix) || LZ4IO_isDevNull(suffix)) {
             missingFiles += LZ4IO_decompressSrcFile(&processed, ress, inFileNamesTable[i], suffix, prefs);
             totalProcessed += processed;
             continue;
         }
-        if (ofnSize <= ifnSize-suffixSize+1) {
-            free(outFileName);
-            ofnSize = ifnSize + 20;
-            outFileName = (char*)malloc(ofnSize);
-            if (outFileName==NULL) END_PROCESS(71, "Memory allocation error");
-        }
-        if (ifnSize <= suffixSize  || !UTIL_sameString(suffixPtr, suffix) ) {
+        /* Validate suffix match before sizing the output buffer: ifnSize <
+         * suffixSize would underflow `ifnSize - suffixSize + 1` and a
+         * suffixPtr formed as `name + ifnSize - suffixSize`. */
+        if (ifnSize <= suffixSize
+            || !UTIL_sameString(inFileNamesTable[i] + ifnSize - suffixSize, suffix)) {
             DISPLAYLEVEL(1, "File extension doesn't match expected LZ4_EXTENSION (%4s); will not process file: %s\n", suffix, inFileNamesTable[i]);
             skippedFiles++;
             continue;
         }
+        neededSize = ifnSize - suffixSize + 1;
+        if (LZ4IO_growFileNameBuffer(&outFileName, &ofnSize, neededSize))
+            END_PROCESS(71, "Memory allocation error");
         memcpy(outFileName, inFileNamesTable[i], ifnSize - suffixSize);
         outFileName[ifnSize-suffixSize] = '\0';
         missingFiles += LZ4IO_decompressDstFile(&processed, ress, inFileNamesTable[i], outFileName, prefs);
